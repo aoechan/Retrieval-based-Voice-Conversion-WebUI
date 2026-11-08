@@ -38,6 +38,7 @@ if __name__ == "__main__":
 
     from configs.config import Config
     from infer import rtrvc as rvc_for_realtime
+    from infer.unvoiced_render import UnvoicedRenderer  # local mod
     from i18n.i18n import I18nAuto
     from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
 
@@ -57,6 +58,8 @@ if __name__ == "__main__":
             self.I_noise_reduce = False
             self.O_noise_reduce = False
             self.rms_mix_rate = 0.0
+            self.output_gain_db = 0.0  # local mod: output volume in dB
+            self.unvoiced_render = False  # local mod: render whispers/breaths in the target voice
             self.index_rate = 0.0
             self.f0method = "rmvpe"
             self.sg_hostapi = ""
@@ -299,6 +302,27 @@ if __name__ == "__main__":
                                 ),
                             ],
                             [
+                                # local mod: output volume slider (dB)
+                                sg.Text("出力音量(dB)"),
+                                sg.Slider(
+                                    range=(-30, 10),
+                                    key="output_gain_db",
+                                    resolution=1,
+                                    orientation="h",
+                                    default_value=data.get("output_gain_db", 0),
+                                    enable_events=True,
+                                ),
+                            ],
+                            [
+                                # local mod: whisper/breath rendering switch
+                                sg.Checkbox(
+                                    "ささやき・ブレスをきれいに変換",
+                                    key="unvoiced_render",
+                                    default=data.get("unvoiced_render", False),
+                                    enable_events=True,
+                                ),
+                            ],
+                            [
                                 sg.Text(i18n("音高算法")),
                                 sg.Radio(
                                     "pm",
@@ -462,6 +486,8 @@ if __name__ == "__main__":
                             "threhold": values["threhold"],
                             "pitch": values["pitch"],
                             "rms_mix_rate": values["rms_mix_rate"],
+                            "output_gain_db": values["output_gain_db"],
+                            "unvoiced_render": values["unvoiced_render"],
                             "index_rate": values["index_rate"],
                             # "device_latency": values["device_latency"],
                             "block_time": values["block_time"],
@@ -503,6 +529,14 @@ if __name__ == "__main__":
                         self.rvc.change_index_rate(values["index_rate"])
                 elif event == "rms_mix_rate":
                     self.gui_config.rms_mix_rate = values["rms_mix_rate"]
+                elif event == "output_gain_db":
+                    # local mod: hot update, must not fall through to stop_stream
+                    self.gui_config.output_gain_db = values["output_gain_db"]
+                elif event == "unvoiced_render":
+                    # local mod: hot toggle, must not fall through to stop_stream
+                    self.gui_config.unvoiced_render = values["unvoiced_render"]
+                    if hasattr(self, "rvc") and hasattr(self, "unvoiced"):
+                        self.rvc.unvoiced_renderer = self.unvoiced if values["unvoiced_render"] else None
                 elif event in ["pm", "rmvpe", "fcpe"]:
                     self.gui_config.f0method = event
                 elif event == "I_noise_reduce":
@@ -559,6 +593,8 @@ if __name__ == "__main__":
             self.gui_config.I_noise_reduce = values["I_noise_reduce"]
             self.gui_config.O_noise_reduce = values["O_noise_reduce"]
             self.gui_config.rms_mix_rate = values["rms_mix_rate"]
+            self.gui_config.output_gain_db = values["output_gain_db"]
+            self.gui_config.unvoiced_render = values["unvoiced_render"]
             self.gui_config.index_rate = values["index_rate"]
             self.gui_config.f0method = ["pm", "rmvpe", "fcpe"][
                 [values["pm"], values["rmvpe"], values["fcpe"]].index(True)
@@ -681,6 +717,9 @@ if __name__ == "__main__":
                 sr=self.gui_config.samplerate, n_fft=4 * self.zc, prop_decrease=0.9
             ).to(self.config.device)
             self.prewarm_cuda_graph()
+            # local mod: attach after prewarm so warm-up audio does not affect its level tracking
+            self.unvoiced = UnvoicedRenderer(self.gui_config.samplerate)
+            self.rvc.unvoiced_renderer = self.unvoiced if self.gui_config.unvoiced_render else None
             self.start_stream()
 
         def prewarm_cuda_graph(self):
@@ -898,6 +937,15 @@ if __name__ == "__main__":
                 infer_wav *= torch.pow(
                     rms1 / rms2, 1.0 - self.gui_config.rms_mix_rate
                 )
+            # local mod: render whispers and breaths in the target voice
+            if self.function == "vc" and getattr(self.rvc, "unvoiced_renderer", None) is not None:
+                pseudo = self.rvc.last_pseudo_audio
+                if pseudo is not None and self.resampler2 is not None:
+                    pseudo = self.resampler2(pseudo)
+                p_len = self.input_wav_res.shape[0] // 160
+                infer_wav = self.unvoiced.render(
+                    infer_wav, pseudo, self.input_wav, self.extra_frame, p_len, self.skip_head
+                )
             # SOLA algorithm from https://github.com/yxlllc/DDSP-SVC
             conv_input = infer_wav[
                 None, None, : self.sola_buffer_frame + self.sola_search_frame
@@ -924,8 +972,10 @@ if __name__ == "__main__":
             self.sola_buffer[:] = infer_wav[
                 self.block_frame : self.block_frame + self.sola_buffer_frame
             ]
+            # local mod: apply output volume (after SOLA, so crossfading is unaffected)
+            output_gain = float(10 ** (self.gui_config.output_gain_db / 20))
             outdata[:] = (
-                infer_wav[: self.block_frame]
+                (infer_wav[: self.block_frame] * output_gain)
                 .repeat(self.gui_config.channels, 1)
                 .t()
                 .cpu()
